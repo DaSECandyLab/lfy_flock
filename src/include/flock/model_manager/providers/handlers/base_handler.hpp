@@ -4,8 +4,16 @@
 #include "flock/metrics/manager.hpp"
 #include "flock/model_manager/providers/handlers/handler.hpp"
 #include "session.hpp"
+#include <algorithm>
+#include <chrono>
+#include <cctype>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <curl/curl.h>
+#include <limits>
+#include <random>
+#include <thread>
 #include <map>
 #include <nlohmann/json.hpp>
 #include <string>
@@ -28,6 +36,8 @@ public:
         std::vector<nlohmann::json> completions;
         if (!_request_batch.empty()) completions = ExecuteBatch(_request_batch, true, contentType, RequestType::Completion);
         _request_batch.clear();
+        // 与请求队列一起清空类型队列，避免下一个 batch 复用到旧的请求类型。
+        _request_types.clear();
         return completions;
     }
 
@@ -35,6 +45,8 @@ public:
         std::vector<nlohmann::json> embeddings;
         if (!_request_batch.empty()) embeddings = ExecuteBatch(_request_batch, true, contentType, RequestType::Embedding);
         _request_batch.clear();
+        // embedding batch 结束后也同步清空类型队列。
+        _request_types.clear();
         return embeddings;
     }
 
@@ -96,16 +108,27 @@ protected:
         }
         return results;
 #else
-        // Native: Use curl multi-handle for parallel requests
+        // Native 路径使用 curl multi-handle 并发发起请求。
+        // 每个请求的状态都保存在 requests 原始下标里，后面按下标解析结果以保证保序。
         struct CurlRequestData {
             std::string response;
             CURL* easy = nullptr;
             std::string payload;
             curl_mime* mime_form = nullptr;
             std::string temp_file_path;
-            bool is_temp_file;
+            bool is_temp_file = false;
+            struct curl_slist* headers = nullptr;
+            // 记录 easy handle 是否已加入/完成，便于异常和收尾时安全移除。
+            bool added = false;
+            bool completed = false;
+            CURLcode curl_result = CURLE_OK;
+            long http_code = 0;
         };
         std::vector<CurlRequestData> requests(jsons.size());
+        if (jsons.empty()) {
+            // 空 batch 直接返回，避免创建无意义的 multi handle。
+            return {};
+        }
         CURLM* multi_handle = curl_multi_init();
 
         // Determine URL based on request type
@@ -123,6 +146,8 @@ protected:
         // Prepare all requests
         for (size_t i = 0; i < jsons.size(); ++i) {
             requests[i].easy = curl_easy_init();
+            // 通过 CURLOPT_PRIVATE 在完成事件中找回原始 request 对象，避免按完成顺序打乱结果。
+            curl_easy_setopt(requests[i].easy, CURLOPT_PRIVATE, &requests[i]);
             curl_easy_setopt(requests[i].easy, CURLOPT_URL, url.c_str());
 
             if (is_transcription) {
@@ -164,22 +189,20 @@ protected:
 
                 curl_easy_setopt(requests[i].easy, CURLOPT_MIMEPOST, requests[i].mime_form);
 
-                // Set headers
-                struct curl_slist* headers = nullptr;
-                headers = curl_slist_append(headers, "Expect:");
+                // headers 挂在 request 上，等请求完成后统一释放，避免 curl 仍使用时被提前释放。
+                requests[i].headers = curl_slist_append(requests[i].headers, "Expect:");
                 for (const auto& h: getExtraHeaders()) {
-                    headers = curl_slist_append(headers, h.c_str());
+                    requests[i].headers = curl_slist_append(requests[i].headers, h.c_str());
                 }
-                curl_easy_setopt(requests[i].easy, CURLOPT_HTTPHEADER, headers);
+                curl_easy_setopt(requests[i].easy, CURLOPT_HTTPHEADER, requests[i].headers);
             } else {
-                // Handle JSON requests (completions/embeddings)
+                // JSON 请求先只准备 payload 和 handle；真正发起由下面的调度循环控制。
                 requests[i].payload = jsons[i].dump();
-                struct curl_slist* headers = nullptr;
-                headers = curl_slist_append(headers, "Content-Type: application/json");
+                requests[i].headers = curl_slist_append(requests[i].headers, "Content-Type: application/json");
                 for (const auto& h: getExtraHeaders()) {
-                    headers = curl_slist_append(headers, h.c_str());
+                    requests[i].headers = curl_slist_append(requests[i].headers, h.c_str());
                 }
-                curl_easy_setopt(requests[i].easy, CURLOPT_HTTPHEADER, headers);
+                curl_easy_setopt(requests[i].easy, CURLOPT_HTTPHEADER, requests[i].headers);
                 curl_easy_setopt(requests[i].easy, CURLOPT_POST, 1L);
                 curl_easy_setopt(requests[i].easy, CURLOPT_POSTFIELDS, requests[i].payload.c_str());
             }
@@ -192,25 +215,150 @@ protected:
                 return size * nmemb; });
             curl_easy_setopt(requests[i].easy, CURLOPT_WRITEDATA, &requests[i].response);
 
-            curl_multi_add_handle(multi_handle, requests[i].easy);
         }
 
-        auto api_start = std::chrono::high_resolution_clock::now();
+        // request_rate 只控制“发起下一个请求”的节奏，不等待前一个请求完成。
+        auto parse_request_rate = []() {
+            const char* env_value = std::getenv("FLOCK_VLLM_REQUEST_RATE");
+            if (env_value == nullptr) {
+                return std::numeric_limits<double>::infinity();
+            }
 
+            auto value = std::string(env_value);
+            std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return std::tolower(c); });
+            if (value.empty() || value == "inf" || value == "infinity" || value == "unlimited") {
+                return std::numeric_limits<double>::infinity();
+            }
+
+            try {
+                const auto parsed = std::stod(value);
+                return parsed > 0 ? parsed : std::numeric_limits<double>::infinity();
+            } catch (...) {
+                return std::numeric_limits<double>::infinity();
+            }
+        };
+
+        // 限制同时在途的请求数；0 表示不额外限制，最多等于本 batch 请求数。
+        auto parse_max_in_flight = [request_count = jsons.size()]() {
+            size_t max_in_flight = 32;
+            if (const char* env_value = std::getenv("FLOCK_VLLM_MAX_IN_FLIGHT")) {
+                try {
+                    max_in_flight = std::stoul(env_value);
+                } catch (...) {
+                    max_in_flight = 32;
+                }
+            }
+            if (max_in_flight == 0) {
+                max_in_flight = request_count;
+            }
+            return std::max<size_t>(1, std::min(max_in_flight, request_count));
+        };
+
+        // 默认使用泊松到达；设置 deterministic 时改为固定间隔，便于复现实验。
+        auto deterministic_arrival = []() {
+            const char* env_value = std::getenv("FLOCK_VLLM_REQUEST_ARRIVAL");
+            if (env_value == nullptr) {
+                return false;
+            }
+            auto value = std::string(env_value);
+            std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return std::tolower(c); });
+            return value == "deterministic";
+        }();
+
+        const auto request_rate = parse_request_rate();
+        const auto max_in_flight = parse_max_in_flight();
+        const auto paced_requests = std::isfinite(request_rate);
+        std::mt19937 rng(std::random_device{}());
+        std::exponential_distribution<double> poisson_interval(paced_requests ? request_rate : 1.0);
+
+        using Clock = std::chrono::steady_clock;
+        auto api_start = Clock::now();
+        auto next_request_time = api_start;
+        size_t next_request_idx = 0;
+        size_t completed_requests = 0;
+        size_t in_flight = 0;
         int still_running = 0;
-        curl_multi_perform(multi_handle, &still_running);
-        while (still_running) {
-            int numfds;
-            curl_multi_wait(multi_handle, NULL, 0, 1000, &numfds);
+
+        auto interval_duration = [](double seconds) {
+            return std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(seconds));
+        };
+
+        // 计算下一次允许发起请求的时间点；无限速时无需更新。
+        auto schedule_next_arrival = [&]() {
+            if (!paced_requests) {
+                return;
+            }
+            const auto interval_seconds = deterministic_arrival ? (1.0 / request_rate) : poisson_interval(rng);
+            next_request_time = Clock::now() + interval_duration(interval_seconds);
+        };
+
+        // 回收已经完成的 easy handle，只记录完成状态；响应内容稍后仍按 requests 下标解析。
+        auto drain_completed_requests = [&]() {
+            int msgs_left = 0;
+            while (auto* msg = curl_multi_info_read(multi_handle, &msgs_left)) {
+                if (msg->msg == CURLMSG_DONE) {
+                    CurlRequestData* request = nullptr;
+                    curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &request);
+                    if (request != nullptr && !request->completed) {
+                        request->completed = true;
+                        request->curl_result = msg->data.result;
+                        curl_easy_getinfo(msg->easy_handle, CURLINFO_RESPONSE_CODE, &request->http_code);
+                        curl_multi_remove_handle(multi_handle, msg->easy_handle);
+                        completed_requests++;
+                    }
+                    if (in_flight > 0) {
+                        in_flight--;
+                    }
+                }
+            }
+        };
+
+        // 调度循环：满足 request_rate 和 max_in_flight 时继续发起新请求，
+        // 同时不断驱动 curl multi 并回收已完成请求。
+        while (completed_requests < jsons.size()) {
+            auto now = Clock::now();
+            while (next_request_idx < jsons.size() && in_flight < max_in_flight && (!paced_requests || now >= next_request_time)) {
+                const auto add_result = curl_multi_add_handle(multi_handle, requests[next_request_idx].easy);
+                if (add_result != CURLM_OK) {
+                    trigger_error(std::string("Failed to add request to curl multi handle: ") + curl_multi_strerror(add_result));
+                }
+                requests[next_request_idx].added = true;
+                next_request_idx++;
+                in_flight++;
+                schedule_next_arrival();
+                now = Clock::now();
+            }
+
             curl_multi_perform(multi_handle, &still_running);
+            drain_completed_requests();
+
+            if (completed_requests >= jsons.size()) {
+                break;
+            }
+
+            long timeout_ms = 1000;
+            if (paced_requests && next_request_idx < jsons.size() && in_flight < max_in_flight) {
+                const auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(next_request_time - Clock::now()).count();
+                timeout_ms = static_cast<long>(std::max<long long>(0, std::min<long long>(wait_ms, 1000)));
+            }
+
+            if (in_flight > 0) {
+                // 有在途请求时等待网络事件；timeout 会被下一次 paced arrival 截断。
+                int numfds = 0;
+                curl_multi_wait(multi_handle, NULL, 0, timeout_ms, &numfds);
+            } else if (paced_requests && next_request_idx < jsons.size()) {
+                // 没有在途请求但还没到下一次到达时间时，直接 sleep 到发起时间。
+                std::this_thread::sleep_until(next_request_time);
+            }
         }
 
-        auto api_end = std::chrono::high_resolution_clock::now();
+        auto api_end = Clock::now();
         double api_duration_ms = std::chrono::duration<double, std::milli>(api_end - api_start).count();
 
         int64_t batch_input_tokens = 0;
         int64_t batch_output_tokens = 0;
 
+        // results 与 jsons/requests 等长并共享下标，因此即使完成顺序不同，返回顺序仍等于请求入队顺序。
         std::vector<nlohmann::json> results(jsons.size());
         for (size_t i = 0; i < requests.size(); ++i) {
             // Clean up temp files for transcriptions
@@ -218,10 +366,12 @@ protected:
                 std::remove(requests[i].temp_file_path.c_str());
             }
 
-            long http_code = 0;
-            curl_easy_getinfo(requests[i].easy, CURLINFO_RESPONSE_CODE, &http_code);
+            const auto http_code = requests[i].http_code;
 
-            if (requests[i].response.empty()) {
+            if (requests[i].curl_result != CURLE_OK) {
+                trigger_error(std::string("Provider request failed: ") + curl_easy_strerror(requests[i].curl_result) +
+                              " (URL: " + url + ")");
+            } else if (requests[i].response.empty()) {
                 trigger_error("Empty response from provider (HTTP " + std::to_string(http_code) + ", URL: " + url + ")");
             } else if (isJson(requests[i].response)) {
                 try {
@@ -256,11 +406,18 @@ protected:
                 trigger_error("Invalid JSON response (HTTP " + std::to_string(http_code) + ", URL: " + url + "): " + requests[i].response);
             }
 
+            if (requests[i].added && !requests[i].completed) {
+                // 异常路径下可能还没收到完成事件，清理前确保从 multi handle 移除。
+                curl_multi_remove_handle(multi_handle, requests[i].easy);
+            }
             // Clean up mime form for transcriptions
             if (is_transcription && requests[i].mime_form) {
                 curl_mime_free(requests[i].mime_form);
             }
-            curl_multi_remove_handle(multi_handle, requests[i].easy);
+            if (requests[i].headers) {
+                // headers 生命周期跟随 easy handle，在请求处理完后统一释放。
+                curl_slist_free_all(requests[i].headers);
+            }
             curl_easy_cleanup(requests[i].easy);
         }
 

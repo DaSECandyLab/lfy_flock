@@ -83,64 +83,111 @@ nlohmann::json ScalarFunctionBase::Complete(nlohmann::json& columns, const std::
 nlohmann::json ScalarFunctionBase::BatchAndComplete(const nlohmann::json& tuples,
                                                     const std::string& user_prompt,
                                                     const ScalarFunctionType function_type, Model& model) {
-    const auto llm_template = PromptManager::GetTemplate(function_type);
-
-    const auto model_details = model.GetModelDetails();
-    auto batch_size = std::min<int>(model.GetModelDetails().batch_size, static_cast<int>(tuples[0]["data"].size()));
-
+    const auto tuple_count = static_cast<int>(tuples[0]["data"].size());
     auto responses = nlohmann::json::array();
 
-    if (batch_size <= 0) {
-        throw std::runtime_error("Batch size must be greater than zero");
+    // 将单元格值转成可直接放入 prompt 的文本；字符串不保留 JSON 引号。
+    auto value_to_string = [](const nlohmann::json& value) {
+        if (value.is_null()) {
+            return std::string("");
+        }
+        if (value.is_string()) {
+            return value.get<std::string>();
+        }
+        return value.dump();
+    };
+
+    // 普通列仍优先走原有 placeholder 语义：找到 {{列名}} 就做逐处替换。
+    auto replace_all = [](std::string& prompt, const std::string& placeholder, const std::string& value) {
+        size_t pos = 0;
+        bool replaced = false;
+        while ((pos = prompt.find(placeholder, pos)) != std::string::npos) {
+            prompt.replace(pos, placeholder.size(), value);
+            pos += value.size();
+            replaced = true;
+        }
+        return replaced;
+    };
+
+    // 这些列不拼进文本 prompt，而是作为当前行的图片/媒体附件传给 provider。
+    auto is_image_column = [](const nlohmann::json& column) {
+        if (!column.contains("type") || !column["type"].is_string()) {
+            return false;
+        }
+        const auto column_type = column["type"].get<std::string>();
+        return column_type == "image" || column_type == "media" || column_type == "photo" || column_type.rfind("image/", 0) == 0;
+    };
+
+    // provider 每个请求只对应一行，因此 media_data 中也只保留当前行的数据。
+    auto build_single_row_column = [](const nlohmann::json& column, const int row_idx) {
+        auto row_column = nlohmann::json::object();
+        for (const auto& item: column.items()) {
+            if (item.key() == "data") {
+                row_column["data"] = nlohmann::json::array({item.value()[row_idx]});
+            } else {
+                row_column[item.key()] = item.value();
+            }
+        }
+        return row_column;
+    };
+
+    OutputType output_type = OutputType::STRING;
+    if (function_type == ScalarFunctionType::FILTER) {
+        output_type = OutputType::BOOL;
     }
 
-    auto batch_tuples = nlohmann::json::array();
-    int start_index = 0;
+    // 先把当前 DuckDB chunk 内的每一行都转成一个独立请求并入队；这里不 collect，
+    // 这样底层 curl multi 可以并发发起这些请求。
+    for (auto row_idx = 0; row_idx < tuple_count; row_idx++) {
+        std::string prompt = user_prompt;
+        auto media_data = nlohmann::json::object();
+        media_data["image"] = nlohmann::json::array();
+        media_data["audio"] = nlohmann::json::array();
 
-    do {
-        batch_tuples.clear();
+        for (auto column_idx = 0; column_idx < static_cast<int>(tuples.size()); column_idx++) {
+            const auto row_column = build_single_row_column(tuples[column_idx], row_idx);
 
-        for (auto i = 0; i < static_cast<int>(tuples.size()); i++) {
-            batch_tuples.push_back(nlohmann::json::object());
-            for (const auto& item: tuples[i].items()) {
-                if (item.key() != "data") {
-                    batch_tuples[i][item.key()] = item.value();
-                } else {
-                    for (auto j = 0; j < batch_size && start_index + j < static_cast<int>(item.value().size()); j++) {
-                        if (j == 0) {
-                            batch_tuples[i]["data"] = nlohmann::json::array();
-                        }
-                        batch_tuples[i]["data"].push_back(item.value()[start_index + j]);
-                    }
-                }
+            if (is_image_column(tuples[column_idx])) {
+                // 图片/媒体列只作为附件传递；不把文件路径/base64 当普通文本替换进 prompt。
+                media_data["image"].push_back(row_column);
+                continue;
+            }
+
+            std::string column_name = "COLUMN " + std::to_string(column_idx + 1);
+            if (tuples[column_idx].contains("name") && tuples[column_idx]["name"].is_string()) {
+                column_name = tuples[column_idx]["name"].get<std::string>();
+            }
+
+            const auto value = value_to_string(tuples[column_idx]["data"][row_idx]);
+            const auto placeholder = "{{" + column_name + "}}";
+            const auto replaced = replace_all(prompt, placeholder, value);
+            if (!replaced) {
+                // 用户 prompt 没写该列的 placeholder 时，按“列名:值;”追加到末尾，
+                // 让“判断这条评论情感”这类无 placeholder prompt 仍能看到行上下文。
+                prompt += "\n";
+                prompt += column_name;
+                prompt += ":";
+                prompt += value;
+                prompt += "; ";
             }
         }
 
-        start_index += batch_size;
+        model.AddCompletionRequest(prompt, 1, output_type, media_data);
+    }
 
-        try {
-            auto response = Complete(batch_tuples, user_prompt, function_type, model);
-
-            if (response.size() < batch_tuples[0]["data"].size()) {
-                for (auto i = static_cast<int>(response.size()); i < batch_tuples[0]["data"].size(); i++) {
-                    response.push_back(nullptr);
-                }
-            } else if (response.size() > batch_tuples[0]["data"].size()) {
-                response.erase(response.begin() + batch_tuples.size(), response.end());
-            }
-
-            for (const auto& tuple: response) {
-                responses.push_back(tuple);
-            }
-        } catch (const ExceededMaxOutputTokensError&) {
-            start_index -= batch_size;
-            batch_size = static_cast<int>(batch_size * 0.9);
-            if (batch_size <= 0) {
-                throw std::runtime_error("Batch size reduced to zero, unable to process tuples");
-            }
+    // 所有行请求都已入队后再统一 collect，保留 batch 内并发能力。
+    const auto completion_responses = model.CollectCompletions();
+    for (auto response_idx = 0; response_idx < tuple_count; response_idx++) {
+        if (response_idx >= static_cast<int>(completion_responses.size()) ||
+            !completion_responses[response_idx].contains("items") ||
+            !completion_responses[response_idx]["items"].is_array() ||
+            completion_responses[response_idx]["items"].empty()) {
+            responses.push_back(nullptr);
+            continue;
         }
-
-    } while (start_index < static_cast<int>(tuples[0]["data"].size()));
+        // CollectCompletions 返回顺序由底层 handler 按请求下标恢复，这里按行号取回结果。
+        responses.push_back(completion_responses[response_idx]["items"][0]);
+    }
 
     return responses;
 }
@@ -205,7 +252,6 @@ duckdb::unique_ptr<LlmFunctionBindData> ScalarFunctionBase::ValidateAndInitializ
     if (initialize_prompt) {
         InitializePrompt(context, arguments[1], *bind_data);
     }
-
     return bind_data;
 }
 
