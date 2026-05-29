@@ -6,35 +6,15 @@ namespace flock {
 
 // Helper function to validate and clean context column, handling NULL values
 static void ValidateAndCleanContextColumn(nlohmann::json& column, const std::initializer_list<const char*>& allowed_keys) {
-    std::string column_type = "";
-    bool has_type = false;
-    bool has_transcription_model = false;
-
     for (const auto& key: allowed_keys) {
         if (key != std::string("data")) {
             bool key_exists = column.contains(key);
             bool is_null = key_exists && column[key].get<std::string>() == "NULL";
 
-            if (key == std::string("type") && key_exists && !is_null) {
-                column_type = column[key].get<std::string>();
-                has_type = true;
-            } else if (key == std::string("transcription_model") && key_exists && !is_null) {
-                has_transcription_model = true;
-            } else if (!key_exists || is_null) {
+            if (!key_exists || is_null) {
                 column.erase(key);
             }
         }
-    }
-
-    // Validate transcription_model is only used with audio type
-    if (has_transcription_model && column_type != "audio") {
-        std::string type_display = has_type ? column_type : "tabular";
-        throw std::runtime_error(duckdb_fmt::format("Argument 'transcription_model' is not supported for data type '{}'. It can only be used with type 'audio'.", type_display));
-    }
-
-    // Validate that audio type requires transcription_model
-    if (has_type && column_type == "audio" && !has_transcription_model) {
-        throw std::runtime_error("Argument 'transcription_model' is required when type is 'audio'.");
     }
 }
 

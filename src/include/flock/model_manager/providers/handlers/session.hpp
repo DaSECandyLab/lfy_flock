@@ -238,13 +238,15 @@ inline void Session::setProxyUrl(const std::string& url) {
 }
 
 inline void Session::setBody(const std::string& data) {
+    // 先把请求体保存到 Session 成员里，再把指针交给 curl。
+    // 不能直接引用临时字符串的内存，否则真正发请求时 POST body 可能已经失效，
+    // 会出现服务端“无法解析请求体”的问题。
+    body_ = data;
 #ifndef __EMSCRIPTEN__
     if (curl_) {
-        curl_easy_setopt(curl_, CURLOPT_POSTFIELDSIZE, data.length());
-        curl_easy_setopt(curl_, CURLOPT_POSTFIELDS, data.data());
+        curl_easy_setopt(curl_, CURLOPT_POSTFIELDSIZE, body_.length());
+        curl_easy_setopt(curl_, CURLOPT_POSTFIELDS, body_.data());
     }
-#else
-    body_ = data;
 #endif
 }
 

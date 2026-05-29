@@ -27,8 +27,13 @@ public:
     explicit Model(const nlohmann::json& model_json);
     explicit Model() = default;
     void AddCompletionRequest(const std::string& prompt, const int num_output_tuples, OutputType output_type = OutputType::STRING, const nlohmann::json& media_data = nlohmann::json::object());
+    // 将 cacheblend 构造好的 token id prompt 继续透传到 provider。
+    // 不启用 cacheblend 的查询仍然走 AddCompletionRequest 的原始文本路径。
+    void AddCompletionRequestTokenIds(const std::vector<int>& prompt_token_ids, const int num_output_tuples, OutputType output_type = OutputType::STRING);
     void AddEmbeddingRequest(const std::vector<std::string>& inputs);
     void AddTranscriptionRequest(const nlohmann::json& audio_files);
+    // 对外暴露 tokenizer，供 cacheblend 在执行阶段把每个 prompt 分段单独编码。
+    std::vector<int> TokenizePrompt(const std::string& prompt, bool add_special_tokens);
     std::vector<nlohmann::json> CollectCompletions(const std::string& contentType = "application/json");
     std::vector<nlohmann::json> CollectEmbeddings(const std::string& contentType = "application/json");
     std::vector<nlohmann::json> CollectTranscriptions(const std::string& contentType = "multipart/form-data");

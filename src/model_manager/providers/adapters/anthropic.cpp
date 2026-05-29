@@ -6,6 +6,7 @@ namespace flock {
 
 // Claude 4.x models support output_format, Claude 3.x models require tool_use fallback
 // See: https://docs.anthropic.com/en/docs/build-with-claude/structured-outputs
+
 static bool SupportsOutputFormat(const std::string& model) {
     // Claude 3.x models (claude-3-haiku, claude-3-sonnet, claude-3-opus, claude-3-5-sonnet, etc.)
     if (model.find("claude-3") != std::string::npos) {
@@ -59,6 +60,7 @@ void AnthropicProvider::AddCompletionRequest(const std::string& prompt, const in
             }
         }
     }
+
 
     nlohmann::json request_payload = {{"model", model_details_.model},
                                       {"messages", {{{"role", "user"}, {"content", message_content}}}}};

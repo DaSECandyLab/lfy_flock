@@ -185,12 +185,22 @@ void Model::AddCompletionRequest(const std::string& prompt, const int num_output
     provider_->AddCompletionRequest(prompt, num_output_tuples, output_type, media_data);
 }
 
+void Model::AddCompletionRequestTokenIds(const std::vector<int>& prompt_token_ids, const int num_output_tuples, OutputType output_type) {
+    // Model 只做一层转发，让 cacheblend 路径不必感知具体 provider 的实现细节。
+    provider_->AddCompletionRequestTokenIds(prompt_token_ids, num_output_tuples, output_type);
+}
+
 void Model::AddEmbeddingRequest(const std::vector<std::string>& inputs) {
     provider_->AddEmbeddingRequest(inputs);
 }
 
 void Model::AddTranscriptionRequest(const nlohmann::json& audio_files) {
     provider_->AddTranscriptionRequest(audio_files);
+}
+
+std::vector<int> Model::TokenizePrompt(const std::string& prompt, bool add_special_tokens) {
+    // cacheblend 需要 provider 返回真实 token 序列，后续才能把多段 prefix/KV cache 拼接给 vLLM。
+    return provider_->TokenizePrompt(prompt, add_special_tokens);
 }
 
 std::vector<nlohmann::json> Model::CollectCompletions(const std::string& contentType) {

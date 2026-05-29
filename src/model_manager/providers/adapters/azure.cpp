@@ -1,8 +1,26 @@
 #include "flock/model_manager/providers/adapters/azure.hpp"
 #include "flock/model_manager/model.hpp"
 #include "flock/model_manager/providers/handlers/url_handler.hpp"
+#include <cstdlib>
 
 namespace flock {
+
+namespace {
+
+nlohmann::json BuildItemSchema(OutputType output_type) {
+    const char* bool_schema_mode = std::getenv("FLOCK_BOOL_SCHEMA_MODE");
+    if (output_type == OutputType::BOOL && bool_schema_mode != nullptr &&
+        std::string(bool_schema_mode) == "string_enum") {
+        return {{"type", "string"}, {"enum", {"true", "false"}}};
+    }
+    if (output_type == OutputType::BOOL && bool_schema_mode != nullptr &&
+        std::string(bool_schema_mode) == "boolean_enum") {
+        return {{"type", "boolean"}, {"enum", {true, false}}};
+    }
+    return {{"type", IProvider::GetOutputTypeString(output_type)}};
+}
+
+}// namespace
 
 void AzureProvider::AddCompletionRequest(const std::string& prompt, const int num_output_tuples, OutputType output_type, const nlohmann::json& media_data) {
 
@@ -64,6 +82,7 @@ void AzureProvider::AddCompletionRequest(const std::string& prompt, const int nu
         }
     }
 
+
     nlohmann::json request_payload = {{"model", model_details_.model},
                                       {"messages", {{{"role", "user"}, {"content", message_content}}}}};
 
@@ -81,13 +100,25 @@ void AzureProvider::AddCompletionRequest(const std::string& prompt, const int nu
                   {"strict", strict},
                   {"schema", {{"type", "object"}, {"properties", {{"items", {{"type", "array"}, {"minItems", num_output_tuples}, {"maxItems", num_output_tuples}, {"items", schema}}}}}, {"required", {"items"}}, {"additionalProperties", false}}}}}};
     } else {
+        const nlohmann::json item_schema = BuildItemSchema(output_type);
+        const nlohmann::json items_schema = {
+                {"type", "array"},
+                {"minItems", num_output_tuples},
+                {"maxItems", num_output_tuples},
+                {"items", item_schema},
+        };
+        const nlohmann::json response_schema = {
+                {"type", "object"},
+                {"properties", {{"items", items_schema}}},
+                {"required", {"items"}},
+                {"additionalProperties", false},
+        };
         request_payload["response_format"] = {
                 {"type", "json_schema"},
                 {"json_schema",
                  {{"name", "flock_response"},
                   {"strict", false},
-                  {"schema", {{"type", "object"}, {"properties", {{"items", {{"type", "array"}, {"minItems", num_output_tuples}, {"maxItems", num_output_tuples}, {"items", {{"type", GetOutputTypeString(output_type)}}}}}}}}}}}};
-        ;
+                  {"schema", response_schema}}}};
     }
 
     model_handler_->AddRequest(request_payload, IModelProviderHandler::RequestType::Completion);

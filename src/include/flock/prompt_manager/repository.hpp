@@ -101,8 +101,8 @@ public:
 
     static constexpr auto FILTER =
             "For each row in the provided table, determine whether it satisfies the user's prompt. "
-            "Return 'true' if the row meets the criteria, and 'false' otherwise. "
-            "Ensure that each row is evaluated independently and that no row is skipped.";
+            "Return a JSON object exactly in this shape: {\"items\":[true,false]}. "
+            "The items array must contain one boolean per input row, in the same order, with no omitted rows.";
 
     // Aggregate Functions
     static constexpr auto REDUCE =

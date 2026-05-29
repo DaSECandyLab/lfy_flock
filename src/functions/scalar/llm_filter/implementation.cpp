@@ -4,8 +4,55 @@
 #include "flock/functions/scalar/scalar.hpp"
 #include "flock/metrics/manager.hpp"
 #include "flock/model_manager/model.hpp"
+#include <algorithm>
+#include <cctype>
+#include <stdexcept>
 
 namespace flock {
+
+namespace {
+
+std::string NormalizeBoolResponse(const nlohmann::json& response) {
+    if (response.is_null()) {
+        throw std::runtime_error("llm_filter received a null model response; refusing to default it to true");
+    }
+    if (response.is_boolean()) {
+        return response.get<bool>() ? "true" : "false";
+    }
+    if (response.is_string()) {
+        const auto value = response.get<std::string>();
+        if (value == "true" || value == "false") {
+            return value;
+        }
+    }
+    throw std::runtime_error("llm_filter expected a boolean-compatible model response, got: " + response.dump());
+}
+
+bool ParseOptionalBoolRuntime(const nlohmann::json& value, bool default_value) {
+    // 运行时再解析一次布尔开关。
+    // 原因是某些 prompt struct 字段在 bind 阶段可能没有完整保留下来，
+    // 这里需要确保 cacheblend 这类开关能以“当前请求实际传入的值”为准。
+    if (value.is_boolean()) {
+        return value.get<bool>();
+    }
+    if (value.is_number_integer()) {
+        return value.get<int64_t>() != 0;
+    }
+    if (value.is_string()) {
+        auto lowered = value.get<std::string>();
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (lowered == "true" || lowered == "1" || lowered == "yes" || lowered == "on") {
+            return true;
+        }
+        if (lowered == "false" || lowered == "0" || lowered == "no" || lowered == "off") {
+            return false;
+        }
+    }
+    return default_value;
+}
+
+}// namespace
 
 duckdb::unique_ptr<duckdb::FunctionData> LlmFilter::Bind(
         duckdb::ClientContext& context,
@@ -45,27 +92,37 @@ std::vector<std::string> LlmFilter::Operation(duckdb::DataChunk& args, LlmFuncti
     }
 
     auto prompt = bind_data->prompt;
+    auto cacheblend = bind_data->cacheblend;
+    // 优先使用当前 DataChunk 中真实传入的 prompt 配置；
+    // 如果运行时没带该字段，再回退到 bind_data 中的默认值/绑定值。
+    if (prompt_context_json.contains("cacheblend")) {
+        cacheblend = ParseOptionalBoolRuntime(prompt_context_json["cacheblend"], cacheblend);
+    }
+    auto blend_special_str = bind_data->blend_special_str;
+    if (prompt_context_json.contains("blend_special_str") && prompt_context_json["blend_special_str"].is_string()) {
+        blend_special_str = prompt_context_json["blend_special_str"].get<std::string>();
+    }
+    auto cacheblend_remove_first_token = bind_data->cacheblend_remove_first_token;
+    if (prompt_context_json.contains("cacheblend_remove_first_token")) {
+        cacheblend_remove_first_token = ParseOptionalBoolRuntime(
+                prompt_context_json["cacheblend_remove_first_token"],
+                cacheblend_remove_first_token);
+    }
 
     std::vector<std::string> results;
     if (context_columns.empty()) {
         auto template_str = prompt;
         model.AddCompletionRequest(template_str, 1, OutputType::BOOL);
         auto response = model.CollectCompletions()[0]["items"][0];
-        if (response.is_null()) {
-            results.push_back("true");
-        } else {
-            results.push_back(response.dump());
-        }
+        results.push_back(NormalizeBoolResponse(response));
     } else {
-        auto responses = BatchAndComplete(context_columns, prompt, ScalarFunctionType::FILTER, model);
+        auto responses = BatchAndComplete(
+                context_columns, prompt, ScalarFunctionType::FILTER, model,
+                cacheblend, blend_special_str, cacheblend_remove_first_token);
 
         results.reserve(responses.size());
         for (const auto& response: responses) {
-            if (response.is_null()) {
-                results.emplace_back("true");
-                continue;
-            }
-            results.push_back(response.dump());
+            results.push_back(NormalizeBoolResponse(response));
         }
     }
 

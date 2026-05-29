@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <curl/curl.h>
+#include <iostream>
 #include <limits>
 #include <random>
 #include <thread>
@@ -78,6 +79,33 @@ public:
 
 public:
 protected:
+    bool DebugLlmIoEnabled() const {
+        const char* env_value = std::getenv("FLOCK_DEBUG_LLM_IO");
+        if (env_value == nullptr) {
+            return false;
+        }
+        auto value = std::string(env_value);
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return std::tolower(c); });
+        return !(value.empty() || value == "0" || value == "false" || value == "off" || value == "no");
+    }
+
+    static const char* RequestTypeName(RequestType request_type) {
+        switch (request_type) {
+            case RequestType::Completion:
+                return "completion";
+            case RequestType::Embedding:
+                return "embedding";
+            case RequestType::Transcription:
+                return "transcription";
+        }
+        return "unknown";
+    }
+
+    void DebugPrintLlmIo(const std::string& label, size_t index, const std::string& payload) const {
+        std::cerr << "[FLOCK_DEBUG_LLM_IO] " << label << " #" << index << ":\n"
+                  << payload << "\n";
+    }
+
     std::vector<nlohmann::json> ExecuteBatch(const std::vector<nlohmann::json>& jsons, bool async = true, const std::string& contentType = "application/json", RequestType request_type = RequestType::Completion) {
 #ifdef __EMSCRIPTEN__
         // WASM: Process requests sequentially using emscripten fetch
@@ -129,6 +157,7 @@ protected:
             // 空 batch 直接返回，避免创建无意义的 multi handle。
             return {};
         }
+        const bool debug_llm_io = DebugLlmIoEnabled();
         CURLM* multi_handle = curl_multi_init();
 
         // Determine URL based on request type
@@ -198,6 +227,9 @@ protected:
             } else {
                 // JSON 请求先只准备 payload 和 handle；真正发起由下面的调度循环控制。
                 requests[i].payload = jsons[i].dump();
+                if (debug_llm_io) {
+                    DebugPrintLlmIo(std::string("request ") + RequestTypeName(request_type), i, jsons[i].dump(2));
+                }
                 requests[i].headers = curl_slist_append(requests[i].headers, "Content-Type: application/json");
                 for (const auto& h: getExtraHeaders()) {
                     requests[i].headers = curl_slist_append(requests[i].headers, h.c_str());
@@ -239,13 +271,15 @@ protected:
         };
 
         // 限制同时在途的请求数；0 表示不额外限制，最多等于本 batch 请求数。
+        // 这里把默认值提升到 2048，与上层 SemBench/Flock 的默认配置保持一致，
+        // 避免未显式设置环境变量时仍退回旧的 32 并发上限。
         auto parse_max_in_flight = [request_count = jsons.size()]() {
-            size_t max_in_flight = 32;
+            size_t max_in_flight = 2048;
             if (const char* env_value = std::getenv("FLOCK_VLLM_MAX_IN_FLIGHT")) {
                 try {
                     max_in_flight = std::stoul(env_value);
                 } catch (...) {
-                    max_in_flight = 32;
+                    max_in_flight = 2048;
                 }
             }
             if (max_in_flight == 0) {
@@ -376,6 +410,9 @@ protected:
             } else if (isJson(requests[i].response)) {
                 try {
                     nlohmann::json parsed = nlohmann::json::parse(requests[i].response);
+                    if (debug_llm_io) {
+                        DebugPrintLlmIo("raw response", i, parsed.dump(2));
+                    }
                     checkResponse(parsed, request_type);
 
                     // Extract token usage for completions/embeddings
@@ -388,6 +425,9 @@ protected:
                     // Let provider extract output based on request type
                     try {
                         results[i] = ExtractOutput(parsed, request_type);
+                        if (debug_llm_io) {
+                            DebugPrintLlmIo("parsed output", i, results[i].dump(2));
+                        }
                     } catch (const std::exception& e) {
                         std::string msg = e.what();
                         if (msg.rfind("[ModelProvider]", 0) == 0) {

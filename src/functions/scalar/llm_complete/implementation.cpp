@@ -3,7 +3,36 @@
 #include "flock/functions/scalar/scalar.hpp"
 #include "flock/metrics/manager.hpp"
 #include "flock/model_manager/model.hpp"
+#include <algorithm>
+#include <cctype>
 
+namespace {
+
+bool ParseOptionalBoolRuntime(const nlohmann::json& value, bool default_value) {
+    // 运行时再解析一次布尔开关。
+    // 这样即使 bind 阶段没有把 cacheblend 等字段完整带下来，
+    // 执行阶段也仍然能按本次请求的真实配置选择路径。
+    if (value.is_boolean()) {
+        return value.get<bool>();
+    }
+    if (value.is_number_integer()) {
+        return value.get<int64_t>() != 0;
+    }
+    if (value.is_string()) {
+        auto lowered = value.get<std::string>();
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (lowered == "true" || lowered == "1" || lowered == "yes" || lowered == "on") {
+            return true;
+        }
+        if (lowered == "false" || lowered == "0" || lowered == "no" || lowered == "off") {
+            return false;
+        }
+    }
+    return default_value;
+}
+
+}// namespace
 
 namespace flock {
 
@@ -47,6 +76,22 @@ std::vector<std::string> LlmComplete::Operation(duckdb::DataChunk& args, LlmFunc
     }
 
     auto prompt = bind_data->prompt;
+    auto cacheblend = bind_data->cacheblend;
+    // 优先读取当前请求里实际携带的 prompt 配置；
+    // 如果没有，再使用 bind_data 中已有的值，保证非 cacheblend 查询继续走原路径。
+    if (prompt_context_json.contains("cacheblend")) {
+        cacheblend = ParseOptionalBoolRuntime(prompt_context_json["cacheblend"], cacheblend);
+    }
+    auto blend_special_str = bind_data->blend_special_str;
+    if (prompt_context_json.contains("blend_special_str") && prompt_context_json["blend_special_str"].is_string()) {
+        blend_special_str = prompt_context_json["blend_special_str"].get<std::string>();
+    }
+    auto cacheblend_remove_first_token = bind_data->cacheblend_remove_first_token;
+    if (prompt_context_json.contains("cacheblend_remove_first_token")) {
+        cacheblend_remove_first_token = ParseOptionalBoolRuntime(
+                prompt_context_json["cacheblend_remove_first_token"],
+                cacheblend_remove_first_token);
+    }
 
     std::vector<std::string> results;
     if (context_columns.empty()) {
@@ -63,7 +108,9 @@ std::vector<std::string> LlmComplete::Operation(duckdb::DataChunk& args, LlmFunc
             return results;
         }
 
-        auto responses = BatchAndComplete(context_columns, prompt, ScalarFunctionType::COMPLETE, model);
+        auto responses = BatchAndComplete(
+                context_columns, prompt, ScalarFunctionType::COMPLETE, model,
+                cacheblend, blend_special_str, cacheblend_remove_first_token);
 
         results.reserve(responses.size());
         for (const auto& response: responses) {

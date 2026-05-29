@@ -6,11 +6,20 @@
 
 namespace flock {
 
+enum class OpenAICompletionApiMode {
+    Chat,
+    Text
+};
+
 class OpenAIModelManager : public BaseModelProviderHandler {
 public:
-    OpenAIModelManager(std::string token, std::string api_base_url, bool throw_exception)
-        : BaseModelProviderHandler(throw_exception), _token(token), _session("OpenAI", throw_exception) {
-        _session.setToken(token, "");
+    OpenAIModelManager(std::string token, std::string api_base_url, bool throw_exception,
+                       OpenAICompletionApiMode completion_api_mode = OpenAICompletionApiMode::Chat)
+        : BaseModelProviderHandler(throw_exception),
+          _token(token),
+          _session("OpenAI", throw_exception),
+          _completion_api_mode(completion_api_mode) {
+        _session.setToken(_token, "");
         if (api_base_url.empty()) {
             _api_base_url = "https://api.openai.com/v1/";
         } else {
@@ -28,8 +37,12 @@ protected:
     std::string _token;
     std::string _api_base_url;
     Session _session;
+    OpenAICompletionApiMode _completion_api_mode;
 
     std::string getCompletionUrl() const override {
+        if (_completion_api_mode == OpenAICompletionApiMode::Text) {
+            return _api_base_url + "completions";
+        }
         return _api_base_url + "chat/completions";
     }
     std::string getEmbedUrl() const override {
@@ -62,7 +75,10 @@ protected:
                 const auto& choice = response["choices"][0];
                 if (choice.contains("finish_reason") && !choice["finish_reason"].is_null()) {
                     std::string finish_reason = choice["finish_reason"].get<std::string>();
-                    if (finish_reason != "stop" && finish_reason != "length") {
+                    if (finish_reason == "length") {
+                        throw std::runtime_error("OpenAI API response hit the max token limit before producing complete JSON. Increase max_tokens or fix the prompt/response_format.");
+                    }
+                    if (finish_reason != "stop") {
                         throw std::runtime_error("OpenAI API did not finish successfully. finish_reason: " + finish_reason);
                     }
                 }
@@ -76,6 +92,10 @@ protected:
     nlohmann::json ExtractCompletionOutput(const nlohmann::json& response) const override {
         if (response.contains("choices") && response["choices"].is_array() && !response["choices"].empty()) {
             const auto& choice = response["choices"][0];
+            if (_completion_api_mode == OpenAICompletionApiMode::Text &&
+                choice.contains("text") && choice["text"].is_string()) {
+                return nlohmann::json::parse(choice["text"].get<std::string>());
+            }
             if (choice.contains("message") && choice["message"].contains("content")) {
                 return nlohmann::json::parse(choice["message"]["content"].get<std::string>());
             }

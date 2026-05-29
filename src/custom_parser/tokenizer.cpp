@@ -42,10 +42,23 @@ Token Tokenizer::ParseJson() {
     }
     auto start = _position++;
     auto brace_count = 1;
+    auto in_string = false;
+    auto escaped = false;
     while (_position < static_cast<int>(_query.size()) && brace_count > 0) {
-        if (_query[_position] == '{') {
+        const auto ch = _query[_position];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == '"') {
+                in_string = false;
+            }
+        } else if (ch == '"') {
+            in_string = true;
+        } else if (ch == '{') {
             ++brace_count;
-        } else if (_query[_position] == '}') {
+        } else if (ch == '}') {
             --brace_count;
         }
         ++_position;

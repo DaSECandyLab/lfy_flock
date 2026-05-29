@@ -47,6 +47,7 @@ TEST(PromptManager, ReplaceSectionEnum) {
     EXPECT_EQ(result, "Repeat then Repeat");
 }
 
+
 // Test cases for PromptManager::ReplaceSection with string target
 TEST(PromptManager, ReplaceSectionString) {
     auto prompt_template = "Replace [this] and [this] but not [that].";

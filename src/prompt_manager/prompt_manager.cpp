@@ -1,6 +1,16 @@
 #include "flock/prompt_manager/prompt_manager.hpp"
 
 namespace flock {
+
+bool PromptManager::IsImageColumn(const nlohmann::json& column) {
+    if (!column.contains("type") || !column["type"].is_string()) {
+        return false;
+    }
+    const auto column_type = column["type"].get<std::string>();
+    return column_type == "image" || column_type == "photo" || column_type.rfind("image/", 0) == 0;
+}
+
+
 template<>
 std::string PromptManager::ToString<PromptSection>(const PromptSection section) {
     switch (section) {

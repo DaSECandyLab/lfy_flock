@@ -49,7 +49,9 @@ public:
                                    ScalarFunctionType function_type, Model& model);
     static nlohmann::json BatchAndComplete(const nlohmann::json& tuples,
                                            const std::string& user_prompt_name, ScalarFunctionType function_type,
-                                           Model& model);
+                                           Model& model, bool cacheblend = false,
+                                           const std::string& blend_special_str = "",
+                                           bool cacheblend_remove_first_token = false);
 
     static duckdb::unique_ptr<LlmFunctionBindData> ValidateAndInitializeBindData(
             duckdb::ClientContext& context,

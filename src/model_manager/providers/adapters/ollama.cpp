@@ -37,6 +37,7 @@ void OllamaProvider::AddCompletionRequest(const std::string& prompt, const int n
         message["images"] = images;
     }
 
+
     nlohmann::json request_payload = {{"model", model_details_.model},
                                       {"messages", nlohmann::json::array({message})},
                                       {"stream", false}};
