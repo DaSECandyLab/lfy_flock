@@ -75,6 +75,27 @@ std::string SanitizeDebugSnippet(std::string text, const size_t max_len = 240) {
     return text.substr(0, max_len) + "...";
 }
 
+bool ParseOptionalBool(const nlohmann::json& value, bool default_value) {
+    if (value.is_boolean()) {
+        return value.get<bool>();
+    }
+    if (value.is_number_integer()) {
+        return value.get<int64_t>() != 0;
+    }
+    if (value.is_string()) {
+        auto lowered = value.get<std::string>();
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (lowered == "true" || lowered == "1" || lowered == "yes" || lowered == "on") {
+            return true;
+        }
+        if (lowered == "false" || lowered == "0" || lowered == "no" || lowered == "off") {
+            return false;
+        }
+    }
+    return default_value;
+}
+
 }// namespace
 
 void ScalarFunctionBase::ValidateArgumentCount(
